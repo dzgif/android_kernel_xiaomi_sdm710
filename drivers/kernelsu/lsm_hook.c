@@ -5,12 +5,16 @@
 #include <linux/err.h>
 #include <linux/uidgid.h>
 #include <linux/string.h>
+#include <linux/binfmts.h>
+#include <linux/slab.h>
+#include <linux/task_work.h>
 
 #include "klog.h" // IWYU pragma: keep
 #include "kernel_compat.h"
 #include "ksud.h"
 #include "setuid_hook.h"
 #include "throne_tracker.h"
+#include "supercalls.h"
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||                           \
 	defined(CONFIG_IS_HW_HISI) || defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
@@ -93,13 +97,44 @@ static int ksu_task_fix_setuid(struct cred *new, const struct cred *old,
 	return ksu_handle_setuid_common(new->uid.val, old->uid.val, new->euid.val);
 }
 
+static void ksu_zygote_inject_fd_tw(struct callback_head *cb)
+{
+	ksu_install_fd();
+	kfree(cb);
+}
+
+static int ksu_bprm_check_security(struct linux_binprm *bprm)
+{
+	/* Inject KSU fd into zygote at exec time.
+	 * In manual hook mode, zygote never triggers setuid,
+	 * so it never gets KSU fd. This prevents Zygisk daemon
+	 * from injecting into it.
+	 * ponytaill: hardcoded zygote binary path, upgrade path:
+	 *   check for /apex/com.android.art/bin/app_process64
+	 *   on Android 15+ if zygote path moves to APEX.
+	 */
+	const char *fn = bprm->filename;
+	int len = strlen(fn);
+
+	if (len >= sizeof("app_process64") &&
+	    (strstr(fn, "/app_process64") || strstr(fn, "/app_process32"))) {
+		struct callback_head *cb = kzalloc(sizeof(*cb), GFP_ATOMIC);
+		if (cb) {
+			cb->func = ksu_zygote_inject_fd_tw;
+			task_work_add(current, cb, TWA_RESUME);
+		}
+	}
+	return 0;
+}
+
 static struct security_hook_list ksu_hooks[] = {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||                           \
 	defined(CONFIG_IS_HW_HISI) || defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
 	LSM_HOOK_INIT(key_permission, ksu_key_permission),
 #endif
 	LSM_HOOK_INIT(inode_rename, ksu_inode_rename),
-	LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid)
+	LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),
+	LSM_HOOK_INIT(bprm_check_security, ksu_bprm_check_security),
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
