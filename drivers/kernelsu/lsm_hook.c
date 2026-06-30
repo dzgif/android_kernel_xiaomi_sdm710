@@ -8,6 +8,8 @@
 #include <linux/binfmts.h>
 #include <linux/slab.h>
 #include <linux/task_work.h>
+#include <linux/cred.h>
+#include <linux/key.h>
 
 #include "klog.h" // IWYU pragma: keep
 #include "kernel_compat.h"
